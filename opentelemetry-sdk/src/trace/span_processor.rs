@@ -36,7 +36,7 @@
 
 use crate::export::trace::{ExportResult, SpanData, SpanExporter};
 use crate::resource::Resource;
-use crate::runtime::{RuntimeChannel, TrySend};
+use std::sync::mpsc::{self, SyncSender, Receiver};
 use crate::trace::Span;
 use futures_channel::oneshot;
 use futures_util::{
@@ -220,19 +220,29 @@ impl SpanProcessor for SimpleSpanProcessor {
 /// [`executor`]: https://docs.rs/futures/0.3/futures/executor/index.html
 /// [`tokio`]: https://tokio.rs
 /// [`async-std`]: https://async.rs
-pub struct BatchSpanProcessor<R: RuntimeChannel> {
-    message_sender: R::Sender<BatchMessage>,
+pub struct BatchSpanProcessor {
+    sender: SyncSender<BatchMessage>,
+    receiver: Arc<Mutex<Receiver<BatchMessage>>>,
+    // message_sender: R::Sender<BatchMessage>,
 }
 
-impl<R: RuntimeChannel> fmt::Debug for BatchSpanProcessor<R> {
+impl BatchSpanProcessor {
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        BatchSpanProcessor { sender, receiver };
+        thread::spawn(move || { });
+    });
+}
+
+impl fmt::Debug for BatchSpanProcessor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BatchSpanProcessor")
-            .field("message_sender", &self.message_sender)
+            //.field("message_sender", &self.message_sender)
             .finish()
     }
 }
 
-impl<R: RuntimeChannel> SpanProcessor for BatchSpanProcessor<R> {
+impl SpanProcessor for BatchSpanProcessor {
     fn on_start(&self, _span: &mut Span, _cx: &Context) {
         // Ignored
     }
@@ -242,7 +252,7 @@ impl<R: RuntimeChannel> SpanProcessor for BatchSpanProcessor<R> {
             return;
         }
 
-        let result = self.message_sender.try_send(BatchMessage::ExportSpan(span));
+        let result = self.sender.send(BatchMessage::ExportSpan(span));
 
         if let Err(err) = result {
             global::handle_error(TraceError::Other(err.into()));
@@ -251,8 +261,8 @@ impl<R: RuntimeChannel> SpanProcessor for BatchSpanProcessor<R> {
 
     fn force_flush(&self) -> TraceResult<()> {
         let (res_sender, res_receiver) = oneshot::channel();
-        self.message_sender
-            .try_send(BatchMessage::Flush(Some(res_sender)))
+        self.sender
+            .send(BatchMessage::Flush(Some(res_sender)))
             .map_err(|err| TraceError::Other(err.into()))?;
 
         futures_executor::block_on(res_receiver)
@@ -262,8 +272,8 @@ impl<R: RuntimeChannel> SpanProcessor for BatchSpanProcessor<R> {
 
     fn shutdown(&self) -> TraceResult<()> {
         let (res_sender, res_receiver) = oneshot::channel();
-        self.message_sender
-            .try_send(BatchMessage::Shutdown(res_sender))
+        self.sender
+            .send(BatchMessage::Shutdown(res_sender))
             .map_err(|err| TraceError::Other(err.into()))?;
 
         futures_executor::block_on(res_receiver)
@@ -274,7 +284,7 @@ impl<R: RuntimeChannel> SpanProcessor for BatchSpanProcessor<R> {
     fn set_resource(&mut self, resource: &Resource) {
         let resource = Arc::new(resource.clone());
         let _ = self
-            .message_sender
+            .sender
             .try_send(BatchMessage::SetResource(resource));
     }
 }
@@ -474,18 +484,17 @@ impl<R: RuntimeChannel> BatchSpanProcessor<R> {
         }));
 
         // Return batch processor with link to worker
-        BatchSpanProcessor { message_sender }
+        BatchSpanProcessor { sender }
     }
 
     /// Create a new batch processor builder
-    pub fn builder<E>(exporter: E, runtime: R) -> BatchSpanProcessorBuilder<E, R>
+    pub fn builder<E>(exporter: E) -> BatchSpanProcessorBuilder<E>
     where
         E: SpanExporter,
     {
         BatchSpanProcessorBuilder {
             exporter,
             config: Default::default(),
-            runtime,
         }
     }
 }
@@ -668,16 +677,14 @@ impl BatchConfigBuilder {
 /// A builder for creating [`BatchSpanProcessor`] instances.
 ///
 #[derive(Debug)]
-pub struct BatchSpanProcessorBuilder<E, R> {
+pub struct BatchSpanProcessorBuilder<E> {
     exporter: E,
     config: BatchConfig,
-    runtime: R,
 }
 
-impl<E, R> BatchSpanProcessorBuilder<E, R>
+impl<E> BatchSpanProcessorBuilder<E>
 where
     E: SpanExporter + 'static,
-    R: RuntimeChannel,
 {
     /// Set the BatchConfig for [BatchSpanProcessorBuilder]
     pub fn with_batch_config(self, config: BatchConfig) -> Self {
@@ -685,8 +692,8 @@ where
     }
 
     /// Build a batch processor
-    pub fn build(self) -> BatchSpanProcessor<R> {
-        BatchSpanProcessor::new(Box::new(self.exporter), self.config, self.runtime)
+    pub fn build(self) -> BatchSpanProcessor {
+        BatchSpanProcessor::new(Box::new(self.exporter), self.config)
     }
 }
 
@@ -868,7 +875,6 @@ mod tests {
         temp_env::with_vars(env_vars.clone(), || {
             let builder = BatchSpanProcessor::builder(
                 InMemorySpanExporterBuilder::new().build(),
-                runtime::Tokio,
             );
             // export batch size cannot exceed max queue size
             assert_eq!(builder.config.max_export_batch_size, 500);
@@ -891,7 +897,6 @@ mod tests {
         temp_env::with_vars(env_vars, || {
             let builder = BatchSpanProcessor::builder(
                 InMemorySpanExporterBuilder::new().build(),
-                runtime::Tokio,
             );
             assert_eq!(builder.config.max_export_batch_size, 120);
             assert_eq!(builder.config.max_queue_size, 120);

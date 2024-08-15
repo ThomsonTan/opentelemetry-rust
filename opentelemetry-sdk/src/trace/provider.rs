@@ -8,7 +8,6 @@
 //! propagators) are provided by the [`TracerProvider`]. [`Tracer`] instances do
 //! not duplicate this data to avoid that different [`Tracer`] instances
 //! of the [`TracerProvider`] have different versions of these data.
-use crate::runtime::RuntimeChannel;
 use crate::trace::{
     BatchSpanProcessor, Config, RandomIdGenerator, Sampler, SimpleSpanProcessor, SpanLimits, Tracer,
 };
@@ -239,12 +238,11 @@ impl Builder {
     }
 
     /// The [`SpanExporter`] setup using a default [`BatchSpanProcessor`] that this provider should use.
-    pub fn with_batch_exporter<T: SpanExporter + 'static, R: RuntimeChannel>(
+    pub fn with_batch_exporter<T: SpanExporter + 'static>(
         self,
         exporter: T,
-        runtime: R,
     ) -> Self {
-        let batch = BatchSpanProcessor::builder(exporter, runtime).build();
+        let batch = BatchSpanProcessor::builder(exporter).build();
         self.with_span_processor(batch)
     }
 
