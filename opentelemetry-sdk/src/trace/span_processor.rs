@@ -53,6 +53,7 @@ use opentelemetry::{
 use std::cmp::min;
 use std::sync::{Arc, Mutex};
 use std::{env, fmt, str::FromStr, time::Duration};
+use std::thread;
 
 /// Delay interval between two consecutive exports.
 const OTEL_BSP_SCHEDULE_DELAY: &str = "OTEL_BSP_SCHEDULE_DELAY";
@@ -222,16 +223,8 @@ impl SpanProcessor for SimpleSpanProcessor {
 /// [`async-std`]: https://async.rs
 pub struct BatchSpanProcessor {
     sender: SyncSender<BatchMessage>,
-    receiver: Arc<Mutex<Receiver<BatchMessage>>>,
+    // exporter: Box<dyn SpanExporter>,
     // message_sender: R::Sender<BatchMessage>,
-}
-
-impl BatchSpanProcessor {
-    fn new() -> Self {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        BatchSpanProcessor { sender, receiver };
-        thread::spawn(move || { });
-    });
 }
 
 impl fmt::Debug for BatchSpanProcessor {
@@ -307,181 +300,193 @@ enum BatchMessage {
     SetResource(Arc<Resource>),
 }
 
-struct BatchSpanProcessorInternal<R> {
+struct BatchSpanProcessorInternal {
     spans: Vec<SpanData>,
     export_tasks: FuturesUnordered<BoxFuture<'static, ExportResult>>,
-    runtime: R,
     exporter: Box<dyn SpanExporter>,
     config: BatchConfig,
 }
 
-impl<R: RuntimeChannel> BatchSpanProcessorInternal<R> {
-    async fn flush(&mut self, res_channel: Option<oneshot::Sender<ExportResult>>) {
-        let export_task = self.export();
-        let task = Box::pin(async move {
-            let result = export_task.await;
+impl BatchSpanProcessorInternal {
+    // async fn flush(&mut self, res_channel: Option<oneshot::Sender<ExportResult>>) {
+    //     let export_task = self.export();
+    //     let task = Box::pin(async move {
+    //         let result = export_task.await;
 
-            if let Some(channel) = res_channel {
-                if let Err(result) = channel.send(result) {
-                    global::handle_error(TraceError::from(format!(
-                        "failed to send flush result: {:?}",
-                        result
-                    )));
-                }
-            } else if let Err(err) = result {
-                global::handle_error(err);
-            }
+    //         if let Some(channel) = res_channel {
+    //             if let Err(result) = channel.send(result) {
+    //                 global::handle_error(TraceError::from(format!(
+    //                     "failed to send flush result: {:?}",
+    //                     result
+    //                 )));
+    //             }
+    //         } else if let Err(err) = result {
+    //             global::handle_error(err);
+    //         }
 
-            Ok(())
-        });
+    //         Ok(())
+    //     });
 
-        if self.config.max_concurrent_exports == 1 {
-            let _ = task.await;
-        } else {
-            self.export_tasks.push(task);
-            while self.export_tasks.next().await.is_some() {}
-        }
-    }
+    //     if self.config.max_concurrent_exports == 1 {
+    //         let _ = task.await;
+    //     } else {
+    //         self.export_tasks.push(task);
+    //         while self.export_tasks.next().await.is_some() {}
+    //     }
+    // }
 
-    /// Process a single message
-    ///
-    /// A return value of false indicates shutdown
-    async fn process_message(&mut self, message: BatchMessage) -> bool {
-        match message {
-            // Span has finished, add to buffer of pending spans.
-            BatchMessage::ExportSpan(span) => {
-                self.spans.push(span);
+    // Process a single message
+    //
+    // A return value of false indicates shutdown
+    // async fn process_message(&mut self, message: BatchMessage) -> bool {
+    //     match message {
+    //         // Span has finished, add to buffer of pending spans.
+    //         BatchMessage::ExportSpan(span) => {
+    //             self.spans.push(span);
 
-                if self.spans.len() == self.config.max_export_batch_size {
-                    // If concurrent exports are saturated, wait for one to complete.
-                    if !self.export_tasks.is_empty()
-                        && self.export_tasks.len() == self.config.max_concurrent_exports
-                    {
-                        self.export_tasks.next().await;
-                    }
+    //             if self.spans.len() == self.config.max_export_batch_size {
+    //                 // If concurrent exports are saturated, wait for one to complete.
+    //                 if !self.export_tasks.is_empty()
+    //                     && self.export_tasks.len() == self.config.max_concurrent_exports
+    //                 {
+    //                     self.export_tasks.next().await;
+    //                 }
 
-                    let export_task = self.export();
-                    let task = async move {
-                        if let Err(err) = export_task.await {
-                            global::handle_error(err);
-                        }
+    //                 let export_task = self.export();
+    //                 let task = async move {
+    //                     if let Err(err) = export_task.await {
+    //                         global::handle_error(err);
+    //                     }
 
-                        Ok(())
-                    };
-                    // Special case when not using concurrent exports
-                    if self.config.max_concurrent_exports == 1 {
-                        let _ = task.await;
-                    } else {
-                        self.export_tasks.push(Box::pin(task));
-                    }
-                }
-            }
-            // Span batch interval time reached or a force flush has been invoked, export
-            // current spans.
-            //
-            // This is a hint to ensure that any tasks associated with Spans for which the
-            // SpanProcessor had already received events prior to the call to ForceFlush
-            // SHOULD be completed as soon as possible, preferably before returning from
-            // this method.
-            //
-            // In particular, if any SpanProcessor has any associated exporter, it SHOULD
-            // try to call the exporter's Export with all spans for which this was not
-            // already done and then invoke ForceFlush on it. The built-in SpanProcessors
-            // MUST do so. If a timeout is specified (see below), the SpanProcessor MUST
-            // prioritize honoring the timeout over finishing all calls. It MAY skip or
-            // abort some or all Export or ForceFlush calls it has made to achieve this
-            // goal.
-            //
-            // NB: `force_flush` is not currently implemented on exporters; the equivalent
-            // would be waiting for exporter tasks to complete. In the case of
-            // channel-coupled exporters, they will need a `force_flush` implementation to
-            // properly block.
-            BatchMessage::Flush(res_channel) => {
-                self.flush(res_channel).await;
-            }
-            // Stream has terminated or processor is shutdown, return to finish execution.
-            BatchMessage::Shutdown(ch) => {
-                self.flush(Some(ch)).await;
-                self.exporter.shutdown();
-                return false;
-            }
-            // propagate the resource
-            BatchMessage::SetResource(resource) => {
-                self.exporter.set_resource(&resource);
-            }
-        }
-        true
-    }
+    //                     Ok(())
+    //                 };
+    //                 // Special case when not using concurrent exports
+    //                 if self.config.max_concurrent_exports == 1 {
+    //                     let _ = task.await;
+    //                 } else {
+    //                     self.export_tasks.push(Box::pin(task));
+    //                 }
+    //             }
+    //         }
+    //         // Span batch interval time reached or a force flush has been invoked, export
+    //         // current spans.
+    //         //
+    //         // This is a hint to ensure that any tasks associated with Spans for which the
+    //         // SpanProcessor had already received events prior to the call to ForceFlush
+    //         // SHOULD be completed as soon as possible, preferably before returning from
+    //         // this method.
+    //         //
+    //         // In particular, if any SpanProcessor has any associated exporter, it SHOULD
+    //         // try to call the exporter's Export with all spans for which this was not
+    //         // already done and then invoke ForceFlush on it. The built-in SpanProcessors
+    //         // MUST do so. If a timeout is specified (see below), the SpanProcessor MUST
+    //         // prioritize honoring the timeout over finishing all calls. It MAY skip or
+    //         // abort some or all Export or ForceFlush calls it has made to achieve this
+    //         // goal.
+    //         //
+    //         // NB: `force_flush` is not currently implemented on exporters; the equivalent
+    //         // would be waiting for exporter tasks to complete. In the case of
+    //         // channel-coupled exporters, they will need a `force_flush` implementation to
+    //         // properly block.
+    //         BatchMessage::Flush(res_channel) => {
+    //             self.flush(res_channel).await;
+    //         }
+    //         // Stream has terminated or processor is shutdown, return to finish execution.
+    //         BatchMessage::Shutdown(ch) => {
+    //             self.flush(Some(ch)).await;
+    //             self.exporter.shutdown();
+    //             return false;
+    //         }
+    //         // propagate the resource
+    //         BatchMessage::SetResource(resource) => {
+    //             self.exporter.set_resource(&resource);
+    //         }
+    //     }
+    //     true
+    // }
 
-    fn export(&mut self) -> BoxFuture<'static, ExportResult> {
-        // Batch size check for flush / shutdown. Those methods may be called
-        // when there's no work to do.
-        if self.spans.is_empty() {
-            return Box::pin(future::ready(Ok(())));
-        }
+    // fn export(&mut self) -> BoxFuture<'static, ExportResult> {
+    //     // Batch size check for flush / shutdown. Those methods may be called
+    //     // when there's no work to do.
+    //     if self.spans.is_empty() {
+    //         return Box::pin(future::ready(Ok(())));
+    //     }
 
-        let export = self.exporter.export(self.spans.split_off(0));
-        let timeout = self.runtime.delay(self.config.max_export_timeout);
-        let time_out = self.config.max_export_timeout;
+    //     let export = self.exporter.export(self.spans.split_off(0));
+    //     // let timeout = self.runtime.delay(self.config.max_export_timeout);
+    //     let time_out = self.config.max_export_timeout;
 
-        Box::pin(async move {
-            match future::select(export, timeout).await {
-                Either::Left((export_res, _)) => export_res,
-                Either::Right((_, _)) => ExportResult::Err(TraceError::ExportTimedOut(time_out)),
-            }
-        })
-    }
+    //     Box::pin(async move {
+    //         match future::select(export, timeout).await {
+    //             Either::Left((export_res, _)) => export_res,
+    //             Either::Right((_, _)) => ExportResult::Err(TraceError::ExportTimedOut(time_out)),
+    //         }
+    //     })
+    // }
 
-    async fn run(mut self, mut messages: impl FusedStream<Item = BatchMessage> + Unpin) {
-        loop {
-            select! {
-                // FuturesUnordered implements Fuse intelligently such that it
-                // will become eligible again once new tasks are added to it.
-                _ = self.export_tasks.next() => {
-                    // An export task completed; do we need to do anything with it?
-                },
-                message = messages.next() => {
-                    match message {
-                        Some(message) => {
-                            if !self.process_message(message).await {
-                                break;
-                            }
-                        },
-                        None => break,
-                    }
-                },
-            }
-        }
-    }
+    // async fn run(mut self, mut messages: impl FusedStream<Item = BatchMessage> + Unpin) {
+    //     loop {
+    //         select! {
+    //             // FuturesUnordered implements Fuse intelligently such that it
+    //             // will become eligible again once new tasks are added to it.
+    //             _ = self.export_tasks.next() => {
+    //                 // An export task completed; do we need to do anything with it?
+    //             },
+    //             message = messages.next() => {
+    //                 match message {
+    //                     Some(message) => {
+    //                         if !self.process_message(message).await {
+    //                             break;
+    //                         }
+    //                     },
+    //                     None => break,
+    //                 }
+    //             },
+    //         }
+    //     }
+    // }
 }
 
-impl<R: RuntimeChannel> BatchSpanProcessor<R> {
-    pub(crate) fn new(exporter: Box<dyn SpanExporter>, config: BatchConfig, runtime: R) -> Self {
-        let (message_sender, message_receiver) =
-            runtime.batch_message_channel(config.max_queue_size);
+impl BatchSpanProcessor {
 
-        let inner_runtime = runtime.clone();
-        // Spawn worker process via user-defined spawn function.
-        runtime.spawn(Box::pin(async move {
-            // Timer will take a reference to the current runtime, so its important we do this within the
-            // runtime.spawn()
-            let ticker = inner_runtime
-                .interval(config.scheduled_delay)
-                .skip(1) // The ticker is fired immediately, so we should skip the first one to align with the interval.
-                .map(|_| BatchMessage::Flush(None));
-            let timeout_runtime = inner_runtime.clone();
+    pub(crate) fn new(exporter: Box<dyn SpanExporter>, config: BatchConfig) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            for message in receiver {
+                // exporter.export(message);
+                // match message {
+                //     BatchMessage::ExportSpan(span) => {
+                //         exporter.export(vec![span]);
+                //     }
+                // }
+            }
+        });
 
-            let messages = Box::pin(stream::select(message_receiver, ticker));
-            let processor = BatchSpanProcessorInternal {
-                spans: Vec::new(),
-                export_tasks: FuturesUnordered::new(),
-                runtime: timeout_runtime,
-                config,
-                exporter,
-            };
+        // let (message_sender, message_receiver) =
+        //     runtime.batch_message_channel(config.max_queue_size);
 
-            processor.run(messages).await
-        }));
+        // let inner_runtime = runtime.clone();
+        // // Spawn worker process via user-defined spawn function.
+        // runtime.spawn(Box::pin(async move {
+        //     // Timer will take a reference to the current runtime, so its important we do this within the
+        //     // runtime.spawn()
+        //     let ticker = inner_runtime
+        //         .interval(config.scheduled_delay)
+        //         .skip(1) // The ticker is fired immediately, so we should skip the first one to align with the interval.
+        //         .map(|_| BatchMessage::Flush(None));
+        //     let timeout_runtime = inner_runtime.clone();
+
+        //     let messages = Box::pin(stream::select(message_receiver, ticker));
+        //     let processor = BatchSpanProcessorInternal {
+        //         spans: Vec::new(),
+        //         export_tasks: FuturesUnordered::new(),
+        //         runtime: timeout_runtime,
+        //         config,
+        //         exporter,
+        //     };
+
+        //     processor.run(messages).await
+        // }));
 
         // Return batch processor with link to worker
         BatchSpanProcessor { sender }
@@ -706,7 +711,6 @@ mod tests {
         OTEL_BSP_SCHEDULE_DELAY, OTEL_BSP_SCHEDULE_DELAY_DEFAULT,
     };
     use crate::export::trace::{ExportResult, SpanData, SpanExporter};
-    use crate::runtime;
     use crate::testing::trace::{
         new_test_export_span_data, new_tokio_test_exporter, InMemorySpanExporterBuilder,
     };
@@ -911,7 +915,7 @@ mod tests {
             ..Default::default()
         };
         let processor =
-            BatchSpanProcessor::new(Box::new(exporter), config, runtime::TokioCurrentThread);
+            BatchSpanProcessor::new(Box::new(exporter), config);
         let handle = tokio::spawn(async move {
             loop {
                 if let Some(span) = export_receiver.recv().await {
@@ -1010,7 +1014,7 @@ mod tests {
             delay_for: Duration::from_millis(if !time_out { 5 } else { 60 }),
             delay_fn: async_std::task::sleep,
         };
-        let processor = BatchSpanProcessor::new(Box::new(exporter), config, runtime::AsyncStd);
+        let processor = BatchSpanProcessor::new(Box::new(exporter), config);
         processor.on_end(new_test_export_span_data());
         let flush_res = processor.force_flush();
         if time_out {
@@ -1035,7 +1039,7 @@ mod tests {
             delay_fn: tokio::time::sleep,
         };
         let processor =
-            BatchSpanProcessor::new(Box::new(exporter), config, runtime::TokioCurrentThread);
+            BatchSpanProcessor::new(Box::new(exporter), config);
         tokio::time::sleep(Duration::from_secs(1)).await; // skip the first
         processor.on_end(new_test_export_span_data());
         let flush_res = processor.force_flush();

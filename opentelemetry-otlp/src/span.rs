@@ -146,7 +146,7 @@ fn build_batch_with_exporter<R: RuntimeChannel>(
     batch_config: Option<sdk::trace::BatchConfig>,
 ) -> sdk::trace::TracerProvider {
     let mut provider_builder = sdk::trace::TracerProvider::builder();
-    let batch_processor = sdk::trace::BatchSpanProcessor::builder(exporter, runtime)
+    let batch_processor = sdk::trace::BatchSpanProcessor::builder(exporter)
         .with_batch_config(batch_config.unwrap_or_default())
         .build();
     provider_builder = provider_builder.with_span_processor(batch_processor);

@@ -158,7 +158,7 @@ impl ZipkinPipelineBuilder {
     pub fn install_batch<R: RuntimeChannel>(mut self, runtime: R) -> Result<Tracer, TraceError> {
         let (config, endpoint) = self.init_config_and_endpoint();
         let exporter = self.init_exporter_with_endpoint(endpoint)?;
-        let mut provider_builder = TracerProvider::builder().with_batch_exporter(exporter, runtime);
+        let mut provider_builder = TracerProvider::builder().with_batch_exporter(exporter);
         provider_builder = provider_builder.with_config(config);
         let provider = provider_builder.build();
         let tracer =

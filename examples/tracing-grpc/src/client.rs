@@ -22,7 +22,6 @@ fn init_tracer() {
                     Ok(())
                 })
                 .build(),
-            Tokio,
         )
         .build();
 
