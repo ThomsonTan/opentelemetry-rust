@@ -36,7 +36,7 @@
 
 use crate::export::trace::{ExportResult, SpanData, SpanExporter};
 use crate::resource::Resource;
-use std::sync::mpsc::{self, SyncSender, Receiver};
+use std::sync::mpsc::{self, SyncSender};
 use crate::trace::Span;
 use futures_channel::oneshot;
 use futures_util::{
@@ -449,16 +449,26 @@ impl BatchSpanProcessorInternal {
 
 impl BatchSpanProcessor {
 
-    pub(crate) fn new(exporter: Box<dyn SpanExporter>, config: BatchConfig) -> Self {
+    pub(crate) fn new(mut exporter: Box<dyn SpanExporter>, config: BatchConfig) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
             for message in receiver {
-                // exporter.export(message);
-                // match message {
-                //     BatchMessage::ExportSpan(span) => {
-                //         exporter.export(vec![span]);
-                //     }
-                // }
+                match message {
+                    BatchMessage::ExportSpan(span) => {
+                        exporter.export(vec![span]);
+                    }
+                    BatchMessage::Flush(res_channel) => {
+                        // self.flush(res_channel).await;
+                    }
+                    BatchMessage::Shutdown(ch) => {
+                        // self.flush(Some(ch)).await;
+                        exporter.shutdown();
+                        break;
+                    }
+                    BatchMessage::SetResource(resource) => {
+                        exporter.set_resource(&resource);
+                    }
+                }
             }
         });
 
