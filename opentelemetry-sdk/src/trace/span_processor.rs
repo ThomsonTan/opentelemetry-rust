@@ -223,6 +223,7 @@ impl SpanProcessor for SimpleSpanProcessor {
 /// [`async-std`]: https://async.rs
 pub struct BatchSpanProcessor {
     sender: SyncSender<BatchMessage>,
+    handle: thread::JoinHandle<()>,
     // exporter: Box<dyn SpanExporter>,
     // message_sender: R::Sender<BatchMessage>,
 }
@@ -300,14 +301,14 @@ enum BatchMessage {
     SetResource(Arc<Resource>),
 }
 
-struct BatchSpanProcessorInternal {
-    spans: Vec<SpanData>,
-    export_tasks: FuturesUnordered<BoxFuture<'static, ExportResult>>,
-    exporter: Box<dyn SpanExporter>,
-    config: BatchConfig,
-}
+// struct BatchSpanProcessorInternal {
+//     spans: Vec<SpanData>,
+//     export_tasks: FuturesUnordered<BoxFuture<'static, ExportResult>>,
+//     exporter: Box<dyn SpanExporter>,
+//     config: BatchConfig,
+// }
 
-impl BatchSpanProcessorInternal {
+// impl BatchSpanProcessorInternal {
     // async fn flush(&mut self, res_channel: Option<oneshot::Sender<ExportResult>>) {
     //     let export_task = self.export();
     //     let task = Box::pin(async move {
@@ -445,19 +446,20 @@ impl BatchSpanProcessorInternal {
     //         }
     //     }
     // }
-}
+// }
 
 impl BatchSpanProcessor {
 
     pub(crate) fn new(mut exporter: Box<dyn SpanExporter>, config: BatchConfig) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || {
+        let (sender, receiver) = mpsc::sync_channel(config.max_queue_size);
+        let handle = thread::spawn(move || {
             for message in receiver {
                 match message {
                     BatchMessage::ExportSpan(span) => {
                         exporter.export(vec![span]);
                     }
                     BatchMessage::Flush(res_channel) => {
+                        let export_task = exporter.export(vec![]);
                         // self.flush(res_channel).await;
                     }
                     BatchMessage::Shutdown(ch) => {
@@ -499,7 +501,7 @@ impl BatchSpanProcessor {
         // }));
 
         // Return batch processor with link to worker
-        BatchSpanProcessor { sender }
+        BatchSpanProcessor { sender, handle }
     }
 
     /// Create a new batch processor builder
